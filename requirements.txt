@@ -1,0 +1,15 @@
+# R package dependencies for JudgmentBench reproduction code.
+# Tested with R 4.2+. Install all via:
+#   Rscript -e 'install.packages(scan("requirements.txt", what=character(), comment.char="#"))'
+
+dplyr
+tidyr
+readr
+tibble
+ggplot2
+purrr
+ragg
+gtable
+jsonlite
+patchwork
+stringr
