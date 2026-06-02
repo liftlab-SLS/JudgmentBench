@@ -729,21 +729,82 @@ read_judgmentbench_task_metadata <- function(jb_dir) {
 # Table builders
 # ------------------------------------------------------------
 
-# Per-task timing and skip-rate metrics derived from completed blocks: median
-# time per task block, share of attempted blocks that were skipped, and the
-# count of completed blocks per task. Inputs come from validate_blocks_for_tables.
-build_task_metrics <- function(block_summary) {
-  # Skip rates use reached blocks; times use complete blocks only.
-  skip_metrics <- block_summary %>%
+# Compute per-task skip rate from assignment_records.csv directly. This is
+# resilient to a data-release inconsistency where some rows in
+# assignment_records.csv with status="completed" don't have a corresponding row
+# in the published annotations CSVs (e.g., filtered during release for empty
+# comments or PII). The combined-data path in validate_blocks_for_tables would
+# wrongly tag those blocks as fully skipped (it only sees the non-completed
+# rows for those blocks); reading assignment_records directly avoids the issue
+# and reproduces the paper's Table 2 skip rates.
+compute_skip_metrics_from_assignment_records <- function(jb_dir) {
+  assignment_records <- readr::read_csv(
+    file.path(jb_dir, "human", "assignment_records.csv"),
+    show_col_types = FALSE
+  )
+
+  # Block = (annotator, task_id, task_slot, method). Same grouping the
+  # combined-data path uses, just sourced from assignment_records alone.
+  assignment_records %>%
+    dplyr::mutate(
+      method = normalize_method(method),
+      status = tolower(trimws(status)),
+      task_number = suppressWarnings(as.integer(stringr::str_remove(task_id, "^task_")))
+    ) %>%
+    dplyr::group_by(annotator_id, task_id, task_number, task_slot_order, method) %>%
+    dplyr::summarise(
+      block_status = dplyr::case_when(
+        all(status == "completed", na.rm = TRUE) ~ "completed",
+        any(status == "completed", na.rm = TRUE) ~ "partial",
+        TRUE ~ mode_or_first(status)
+      ),
+      .groups = "drop"
+    ) %>%
     dplyr::group_by(task_number) %>%
     dplyr::summarise(
       reached_blocks = dplyr::n(),
-      complete_blocks = sum(is_complete_expected_shape, na.rm = TRUE),
-      skipped_blocks = sum(is_fully_skipped, na.rm = TRUE),
-      partial_or_incomplete_blocks = sum(is_partial_or_incomplete, na.rm = TRUE),
+      skipped_blocks = sum(block_status == "skipped"),
       skip_rate = skipped_blocks / reached_blocks,
       .groups = "drop"
     )
+}
+
+# Per-task timing and skip-rate metrics derived from completed blocks: median
+# time per task block, share of attempted blocks that were skipped, and the
+# count of completed blocks per task. Inputs come from validate_blocks_for_tables.
+# If skip_metrics_override is provided, its reached_blocks / skipped_blocks /
+# skip_rate columns replace those derived from block_summary (used when the
+# script is run against the published HF data, where annotation-CSV filtering
+# can perturb the combined-data skip count).
+build_task_metrics <- function(block_summary, skip_metrics_override = NULL) {
+  # Block-level diagnostics that depend on the combined-data shape (n_rows,
+  # n_rubric_rungs, n_pref_pairs) always come from block_summary.
+  block_diagnostics <- block_summary %>%
+    dplyr::group_by(task_number) %>%
+    dplyr::summarise(
+      complete_blocks = sum(is_complete_expected_shape, na.rm = TRUE),
+      partial_or_incomplete_blocks = sum(is_partial_or_incomplete, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  if (!is.null(skip_metrics_override)) {
+    skip_metrics <- skip_metrics_override %>%
+      dplyr::left_join(block_diagnostics, by = "task_number") %>%
+      dplyr::select(task_number, reached_blocks, complete_blocks, skipped_blocks,
+                    partial_or_incomplete_blocks, skip_rate)
+  } else {
+    skip_metrics <- block_summary %>%
+      dplyr::group_by(task_number) %>%
+      dplyr::summarise(
+        reached_blocks = dplyr::n(),
+        skipped_blocks = sum(is_fully_skipped, na.rm = TRUE),
+        skip_rate = skipped_blocks / reached_blocks,
+        .groups = "drop"
+      ) %>%
+      dplyr::left_join(block_diagnostics, by = "task_number") %>%
+      dplyr::select(task_number, reached_blocks, complete_blocks, skipped_blocks,
+                    partial_or_incomplete_blocks, skip_rate)
+  }
 
   time_metrics <- block_summary %>%
     dplyr::filter(is_complete_expected_shape, is.finite(block_time_seconds), block_time_seconds >= 0) %>%
@@ -824,13 +885,17 @@ build_task_listing_table <- function(task_meta, task_metrics) {
 }
 
 sanitize_firm <- function(firm, email = NA_character_, pipeline_round = NA_character_, pipeline_instance_id = NA_character_) {
-  # The released annotators.csv already exposes the anonymized organization
-  # labels ("AmLaw 100 firm", "AmLaw 200 firm", "Data Labeling Company").
-  # Pass those through; map blanks to "Not reported" and any other value to
+  # The released annotators.csv exposes the anonymized organization labels
+  # ("AmLaw 100 firm", "AmLaw 200 firm", "Data Labeling Company"). For the
+  # paper, we keep "AmLaw 100 firm" anonymous, but disclose Vorys (AmLaw 200
+  # firm partner) and Snorkel AI (data labeling vendor) by appending or
+  # renaming the labels. Blanks map to "Not reported"; any other value to
   # the catch-all bucket.
   firm_raw <- normalize_spaces(firm)
   dplyr::case_when(
-    firm_raw %in% c("AmLaw 100 firm", "AmLaw 200 firm", "Data Labeling Company") ~ firm_raw,
+    firm_raw == "AmLaw 100 firm" ~ "AmLaw 100 firm",
+    firm_raw == "AmLaw 200 firm" ~ "AmLaw 200 firm (Vorys)",
+    firm_raw == "Data Labeling Company" ~ "AI Data Lab (Snorkel AI)",
     is.na(firm_raw) | firm_raw == "" ~ "Not reported",
     TRUE ~ "Other legal organization"
   )
@@ -885,8 +950,8 @@ build_table4 <- function(dat, complete_block_keys) {
       ),
       firm_order = dplyr::case_when(
         Firm == "AmLaw 100 firm" ~ 1L,
-        Firm == "AmLaw 200 firm" ~ 2L,
-        Firm == "Data Labeling Company" ~ 3L,
+        Firm == "AmLaw 200 firm (Vorys)" ~ 2L,
+        Firm == "AI Data Lab (Snorkel AI)" ~ 3L,
         Firm == "Other legal organization" ~ 4L,
         TRUE ~ 5L
       ),
@@ -1155,10 +1220,10 @@ build_table4_summary <- function(annotator_profiles) {
 
 latex_table1 <- function(table1) {
   lines <- c(
-    "\\begin{table}[H]",
+    "\\begin{table}[!t]",
     "  \\caption{Sample tasks by category and task type.}",
     "  \\label{tab:sampled-tasks-by-type}",
-    "  \\small",
+    "  \\scriptsize",
     "  \\centering",
     "  \\setlength{\\tabcolsep}{3.5pt}",
     "  \\renewcommand{\\arraystretch}{1.08}",
@@ -1464,7 +1529,10 @@ cat("Reading study results and constructing task blocks...\n")
 study_dat <- read_study_results_for_tables(judgmentbench_dir)
 validation <- validate_blocks_for_tables(study_dat)
 block_summary <- validation$block_summary
-task_metrics <- build_task_metrics(block_summary)
+# Skip rates come from assignment_records.csv directly (see function comment);
+# other block diagnostics still come from the combined-data block_summary.
+ar_skip_metrics <- compute_skip_metrics_from_assignment_records(judgmentbench_dir)
+task_metrics <- build_task_metrics(block_summary, skip_metrics_override = ar_skip_metrics)
 
 cat("Building tables...\n")
 table1 <- build_table1(task_meta)
@@ -1483,7 +1551,7 @@ write_lines(latex_table1(table1), versioned_output("table1_sampled_tasks_by_type
 write_lines(
   latex_task_listing_longtable(
     table2,
-    caption = "Benchmark tasks. $\\widetilde{t}$ is median completion time in minutes; skip rate is the share of reached task-method blocks that were fully skipped.",
+    caption = "Benchmark tasks. $\\widetilde{t}$ is median completion time in minutes; skip rate is the share of reached task-method evaluations that were fully skipped.",
     label = "tab:task-level-summary"
   ),
   versioned_output("table2_benchmark_tasks.tex")

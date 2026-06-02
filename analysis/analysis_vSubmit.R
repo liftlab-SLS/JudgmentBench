@@ -1399,6 +1399,142 @@ compute_study_estimate <- function(pref_task_summary, rubric_task_summary) {
 }
 
 # ============================================================
+# Win-rate parallel of the per-task / study-level summaries
+# ============================================================
+#
+# vSubmit_Expanded augments the Spearman-rho recovery metric with an
+# individual-judgment pairwise win rate (ties = 0.5). The bootstrap
+# below resamples once and reports BOTH the rho-based D_hat AND the
+# win-rate-based D_hat_winrate. These helpers compute the per-task and
+# study-level win-rate quantities. The rho path is unchanged.
+
+# Per-task preference WIN RATE: for each task, compute the fraction of
+# individual cross-rung CJ comparisons that picked the higher-ranked rung.
+# Ties cannot occur in CJ data, so this is a simple mean of 0/1 correctness.
+# One row per task with n_pairs and winrate_preference.
+summarise_preference_winrate_tasks <- function(dat_complete, truth_order) {
+  comps <- build_preference_comparisons(dat_complete, truth_order)
+
+  if (nrow(comps) == 0) {
+    return(tibble::tibble(
+      task_number = integer(),
+      task_name = character(),
+      n_pairs = integer(),
+      winrate_preference = numeric()
+    ))
+  }
+
+  rung_rank_lookup <- stats::setNames(seq_along(truth_order), truth_order)
+
+  comps %>%
+    dplyr::mutate(
+      winner_rank = unname(rung_rank_lookup[winner]),
+      loser_rank = unname(rung_rank_lookup[loser]),
+      correct = as.integer(winner_rank > loser_rank)
+    ) %>%
+    dplyr::group_by(task_number, task_name) %>%
+    dplyr::summarise(
+      n_pairs = dplyr::n(),
+      winrate_preference = mean(correct),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(task_number)
+}
+
+# Per-task rubric WIN RATE: within each rubric annotator block (block_key),
+# form all unique cross-rung pairs of (rung_label, rubric_total_points) and
+# check whether the higher-rank rung scored strictly higher. Ties count as
+# 0.5 wins. One row per task with n_pairs and winrate_rubric.
+summarise_rubric_winrate_tasks <- function(dat_complete, truth_order) {
+  rung_rank_lookup <- stats::setNames(seq_along(truth_order), truth_order)
+
+  rubric_dat <- dat_complete %>%
+    dplyr::filter(method == "rubric",
+                  rung_label %in% truth_order,
+                  !is.na(rubric_total_points)) %>%
+    dplyr::transmute(
+      task_number, task_name, block_key,
+      rung_label,
+      rung_rank = unname(rung_rank_lookup[rung_label]),
+      rubric_total_points
+    )
+
+  if (nrow(rubric_dat) == 0) {
+    return(tibble::tibble(
+      task_number = integer(),
+      task_name = character(),
+      n_pairs = integer(),
+      winrate_rubric = numeric()
+    ))
+  }
+
+  pairs <- rubric_dat %>%
+    dplyr::inner_join(
+      rubric_dat,
+      by = c("task_number", "task_name", "block_key"),
+      suffix = c("_a", "_b"),
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::filter(rung_rank_a < rung_rank_b) %>%
+    dplyr::mutate(
+      correct = dplyr::case_when(
+        rubric_total_points_b > rubric_total_points_a ~ 1.0,
+        rubric_total_points_b < rubric_total_points_a ~ 0.0,
+        TRUE ~ 0.5
+      )
+    )
+
+  if (nrow(pairs) == 0) {
+    return(tibble::tibble(
+      task_number = integer(),
+      task_name = character(),
+      n_pairs = integer(),
+      winrate_rubric = numeric()
+    ))
+  }
+
+  pairs %>%
+    dplyr::group_by(task_number, task_name) %>%
+    dplyr::summarise(
+      n_pairs = dplyr::n(),
+      winrate_rubric = mean(correct),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(task_number)
+}
+
+# Study-level win-rate estimand:
+#   D_hat_winrate = mean(winrate_preference over estimable preference tasks)
+#                 - mean(winrate_rubric    over estimable rubric    tasks)
+# Positive favors Comparative Judgments, matching the rho-based D_hat.
+compute_study_winrate_estimate <- function(pref_winrate_summary,
+                                           rubric_winrate_summary) {
+  rubric_estimable <- rubric_winrate_summary %>%
+    dplyr::filter(is.finite(winrate_rubric)) %>%
+    dplyr::arrange(task_number)
+
+  pref_estimable <- pref_winrate_summary %>%
+    dplyr::filter(is.finite(winrate_preference)) %>%
+    dplyr::arrange(task_number)
+
+  mean_winrate_rubric <- if (nrow(rubric_estimable) == 0) NA_real_ else mean(rubric_estimable$winrate_rubric)
+  mean_winrate_preference <- if (nrow(pref_estimable) == 0) NA_real_ else mean(pref_estimable$winrate_preference)
+  D_hat_winrate <- if (is.finite(mean_winrate_rubric) && is.finite(mean_winrate_preference)) {
+    mean_winrate_preference - mean_winrate_rubric
+  } else {
+    NA_real_
+  }
+
+  tibble::tibble(
+    n_tasks_winrate_rubric = nrow(rubric_estimable),
+    n_tasks_winrate_preference = nrow(pref_estimable),
+    mean_winrate_rubric = mean_winrate_rubric,
+    mean_winrate_preference = mean_winrate_preference,
+    D_hat_winrate = D_hat_winrate
+  )
+}
+
+# ============================================================
 # Cluster-first hierarchical bootstrap
 # ============================================================
 #
@@ -1416,7 +1552,8 @@ bootstrap_cluster_hierarchical <- function(
   truth_order,
   n_boot,
   seed,
-  observed_D_hat = NULL
+  observed_D_hat = NULL,
+  observed_D_hat_winrate = NULL
 ) {
   set.seed(seed)
 
@@ -1444,7 +1581,12 @@ bootstrap_cluster_hierarchical <- function(
         mean_rho_preference = numeric(),
         D_hat = numeric(),
         n_tasks_rubric = integer(),
-        n_tasks_preference = integer()
+        n_tasks_preference = integer(),
+        mean_winrate_rubric = numeric(),
+        mean_winrate_preference = numeric(),
+        D_hat_winrate = numeric(),
+        n_tasks_winrate_rubric = integer(),
+        n_tasks_winrate_preference = integer()
       ),
       summary = tibble::tibble(
         n_boot = 0L,
@@ -1458,7 +1600,18 @@ bootstrap_cluster_hierarchical <- function(
         ci_upper = NA_real_,
         prop_D_hat_gt_0 = NA_real_,
         prop_D_hat_lt_0 = NA_real_,
-        prop_D_hat_eq_0 = NA_real_
+        prop_D_hat_eq_0 = NA_real_,
+        n_finite_boot_winrate = 0L,
+        observed_D_hat_winrate = observed_D_hat_winrate %||% NA_real_,
+        bootstrap_se_D_hat_winrate = NA_real_,
+        centered_ci_lower_winrate = NA_real_,
+        centered_ci_upper_winrate = NA_real_,
+        bootstrap_mean_D_hat_winrate = NA_real_,
+        ci_lower_winrate = NA_real_,
+        ci_upper_winrate = NA_real_,
+        prop_D_hat_winrate_gt_0 = NA_real_,
+        prop_D_hat_winrate_lt_0 = NA_real_,
+        prop_D_hat_winrate_eq_0 = NA_real_
       )
     ))
   }
@@ -1521,16 +1674,28 @@ bootstrap_cluster_hierarchical <- function(
     pref_task_summary <- summarise_preference_tasks(boot_dat, truth_order)
     rubric_task_summary <- summarise_rubric_tasks(boot_dat, truth_order)
     study_estimate <- compute_study_estimate(pref_task_summary, rubric_task_summary)
-    
+
+    # Parallel win-rate computation on the SAME resampled boot_dat
+    pref_winrate_summary <- summarise_preference_winrate_tasks(boot_dat, truth_order)
+    rubric_winrate_summary <- summarise_rubric_winrate_tasks(boot_dat, truth_order)
+    study_winrate_estimate <- compute_study_winrate_estimate(
+      pref_winrate_summary, rubric_winrate_summary
+    )
+
     boot_results[[b]] <- tibble::tibble(
       .replicate = b,
       mean_rho_rubric = study_estimate$mean_rho_rubric[[1]],
       mean_rho_preference = study_estimate$mean_rho_preference[[1]],
       D_hat = study_estimate$D_hat[[1]],
       n_tasks_rubric = study_estimate$n_tasks_rubric[[1]],
-      n_tasks_preference = study_estimate$n_tasks_preference[[1]]
+      n_tasks_preference = study_estimate$n_tasks_preference[[1]],
+      mean_winrate_rubric = study_winrate_estimate$mean_winrate_rubric[[1]],
+      mean_winrate_preference = study_winrate_estimate$mean_winrate_preference[[1]],
+      D_hat_winrate = study_winrate_estimate$D_hat_winrate[[1]],
+      n_tasks_winrate_rubric = study_winrate_estimate$n_tasks_winrate_rubric[[1]],
+      n_tasks_winrate_preference = study_winrate_estimate$n_tasks_winrate_preference[[1]]
     )
-    
+
     utils::setTxtProgressBar(progress_bar, b)
   }
   
@@ -1538,6 +1703,9 @@ bootstrap_cluster_hierarchical <- function(
   
   boot_tbl <- dplyr::bind_rows(boot_results)
 
+  normal_critical_value <- stats::qnorm(0.975)
+
+  # ----- rho-based D_hat summary (unchanged from vSubmit) -----
   finite_D_hat <- boot_tbl$D_hat[is.finite(boot_tbl$D_hat)]
   observed_D_hat <- observed_D_hat %||% NA_real_
   bootstrap_se_D_hat <- if (length(finite_D_hat) > 1L) {
@@ -1545,7 +1713,6 @@ bootstrap_cluster_hierarchical <- function(
   } else {
     NA_real_
   }
-  normal_critical_value <- stats::qnorm(0.975)
   centered_ci_lower <- if (is.finite(observed_D_hat) && is.finite(bootstrap_se_D_hat)) {
     observed_D_hat - normal_critical_value * bootstrap_se_D_hat
   } else {
@@ -1557,8 +1724,27 @@ bootstrap_cluster_hierarchical <- function(
     NA_real_
   }
 
-  if (length(finite_D_hat) == 0) {
-    summary_tbl <- tibble::tibble(
+  # ----- win-rate D_hat summary (parallel structure) -----
+  finite_D_hat_winrate <- boot_tbl$D_hat_winrate[is.finite(boot_tbl$D_hat_winrate)]
+  observed_D_hat_winrate <- observed_D_hat_winrate %||% NA_real_
+  bootstrap_se_D_hat_winrate <- if (length(finite_D_hat_winrate) > 1L) {
+    stats::sd(finite_D_hat_winrate)
+  } else {
+    NA_real_
+  }
+  centered_ci_lower_winrate <- if (is.finite(observed_D_hat_winrate) && is.finite(bootstrap_se_D_hat_winrate)) {
+    observed_D_hat_winrate - normal_critical_value * bootstrap_se_D_hat_winrate
+  } else {
+    NA_real_
+  }
+  centered_ci_upper_winrate <- if (is.finite(observed_D_hat_winrate) && is.finite(bootstrap_se_D_hat_winrate)) {
+    observed_D_hat_winrate + normal_critical_value * bootstrap_se_D_hat_winrate
+  } else {
+    NA_real_
+  }
+
+  rho_summary <- if (length(finite_D_hat) == 0) {
+    tibble::tibble(
       n_boot = nrow(boot_tbl),
       n_finite_boot = 0L,
       observed_D_hat = observed_D_hat,
@@ -1573,7 +1759,7 @@ bootstrap_cluster_hierarchical <- function(
       prop_D_hat_eq_0 = NA_real_
     )
   } else {
-    summary_tbl <- tibble::tibble(
+    tibble::tibble(
       n_boot = nrow(boot_tbl),
       n_finite_boot = length(finite_D_hat),
       observed_D_hat = observed_D_hat,
@@ -1588,7 +1774,39 @@ bootstrap_cluster_hierarchical <- function(
       prop_D_hat_eq_0 = mean(finite_D_hat == 0)
     )
   }
-  
+
+  winrate_summary <- if (length(finite_D_hat_winrate) == 0) {
+    tibble::tibble(
+      n_finite_boot_winrate = 0L,
+      observed_D_hat_winrate = observed_D_hat_winrate,
+      bootstrap_se_D_hat_winrate = NA_real_,
+      centered_ci_lower_winrate = NA_real_,
+      centered_ci_upper_winrate = NA_real_,
+      bootstrap_mean_D_hat_winrate = NA_real_,
+      ci_lower_winrate = NA_real_,
+      ci_upper_winrate = NA_real_,
+      prop_D_hat_winrate_gt_0 = NA_real_,
+      prop_D_hat_winrate_lt_0 = NA_real_,
+      prop_D_hat_winrate_eq_0 = NA_real_
+    )
+  } else {
+    tibble::tibble(
+      n_finite_boot_winrate = length(finite_D_hat_winrate),
+      observed_D_hat_winrate = observed_D_hat_winrate,
+      bootstrap_se_D_hat_winrate = bootstrap_se_D_hat_winrate,
+      centered_ci_lower_winrate = centered_ci_lower_winrate,
+      centered_ci_upper_winrate = centered_ci_upper_winrate,
+      bootstrap_mean_D_hat_winrate = mean(finite_D_hat_winrate),
+      ci_lower_winrate = as.numeric(stats::quantile(finite_D_hat_winrate, probs = 0.025)),
+      ci_upper_winrate = as.numeric(stats::quantile(finite_D_hat_winrate, probs = 0.975)),
+      prop_D_hat_winrate_gt_0 = mean(finite_D_hat_winrate > 0),
+      prop_D_hat_winrate_lt_0 = mean(finite_D_hat_winrate < 0),
+      prop_D_hat_winrate_eq_0 = mean(finite_D_hat_winrate == 0)
+    )
+  }
+
+  summary_tbl <- dplyr::bind_cols(rho_summary, winrate_summary)
+
   list(boot_tbl = boot_tbl, summary = summary_tbl)
 }
 # ============================================================
@@ -1604,8 +1822,9 @@ method_display <- function(method) {
 }
 
 method_levels <- c("Comparative Judgments", "Rubrics")
-time_metric_label <- "Time Spent Per Evaluation (≤ 30 min only)"
-metric_levels <- c("Spearman\u2019s \u03c1", time_metric_label)
+time_metric_label <- "Minutes Per Evaluation"
+winrate_metric_label <- "Pairwise Win Rate"
+metric_levels <- c("Spearman\u2019s \u03c1", winrate_metric_label, time_metric_label)
 
 plot_theme_publication <- function(base_size = 14) {
   ggplot2::theme_minimal(base_size = base_size) +
@@ -1644,7 +1863,9 @@ publication_png_device <- function(res) {
 # plus per-evaluation timing rows for the time histogram. The timing side
 # excludes outliers above 30 minutes (these are also the rows reported as
 # excluded in the paper's outlier count).
-build_main_plot_data <- function(pref_task_summary, rubric_task_summary, dat_complete) {
+build_main_plot_data <- function(pref_task_summary, rubric_task_summary, dat_complete,
+                                 pref_winrate_task_summary = NULL,
+                                 rubric_winrate_task_summary = NULL) {
   rho_plot_data <- dplyr::bind_rows(
     rubric_task_summary %>%
       dplyr::filter(is.finite(rho_rubric)) %>%
@@ -1662,6 +1883,29 @@ build_main_plot_data <- function(pref_task_summary, rubric_task_summary, dat_com
       )
   )
 
+  # Per-task win-rate companion (vSubmit_Expanded addition). Same per-task
+  # aggregation as the rho path; each task contributes one win rate per method.
+  winrate_plot_data <- dplyr::bind_rows(
+    if (!is.null(rubric_winrate_task_summary)) {
+      rubric_winrate_task_summary %>%
+        dplyr::filter(is.finite(winrate_rubric)) %>%
+        dplyr::transmute(
+          method = factor("Rubrics", levels = method_levels),
+          metric = factor(winrate_metric_label, levels = metric_levels),
+          value = winrate_rubric
+        )
+    } else NULL,
+    if (!is.null(pref_winrate_task_summary)) {
+      pref_winrate_task_summary %>%
+        dplyr::filter(is.finite(winrate_preference)) %>%
+        dplyr::transmute(
+          method = factor("Comparative Judgments", levels = method_levels),
+          metric = factor(winrate_metric_label, levels = metric_levels),
+          value = winrate_preference
+        )
+    } else NULL
+  )
+
   # Keep the time-panel publication view aligned with the under-30-minute
   # convention. The raw table still keeps the full time data for analysis.
   time_plot_data <- dat_complete %>%
@@ -1674,7 +1918,7 @@ build_main_plot_data <- function(pref_task_summary, rubric_task_summary, dat_com
       value = time_spent_minutes
     )
 
-  dplyr::bind_rows(rho_plot_data, time_plot_data)
+  dplyr::bind_rows(rho_plot_data, winrate_plot_data, time_plot_data)
 }
 
 plot_main_result_panel <- function(main_plot_data) {
@@ -1686,22 +1930,23 @@ plot_main_result_panel <- function(main_plot_data) {
   central_df <- main_plot_data %>%
     dplyr::group_by(method, metric) %>%
     dplyr::summarise(
-      # Recovery panels use means; time panels use medians to match the labels.
+      # Recovery panels (rho, winrate) use means; time panels use medians.
       center_value = dplyr::if_else(
-        metric[[1]] == "Spearman\u2019s \u03c1",
+        as.character(metric[[1]]) %in% c("Spearman\u2019s \u03c1", winrate_metric_label),
         mean(value, na.rm = TRUE),
         stats::median(value, na.rm = TRUE)
       ),
       .groups = "drop"
     ) %>%
     dplyr::mutate(
-      center_label = dplyr::if_else(
-        metric == "Spearman\u2019s \u03c1",
-        sprintf("Mean = %.3f", center_value),
-        sprintf("Median = %.1f min", center_value)
+      center_label = dplyr::case_when(
+        metric == "Spearman\u2019s \u03c1" ~ sprintf("Mean = %.3f", center_value),
+        metric == winrate_metric_label ~ sprintf("Mean = %.3f", center_value),
+        TRUE ~ sprintf("Median = %.1f min", center_value)
       ),
       hjust_value = dplyr::case_when(
         metric == "Spearman\u2019s \u03c1" & center_value > 0.75 ~ 1.05,
+        metric == winrate_metric_label & center_value > 0.65 ~ 1.05,
         TRUE ~ -0.05
       ),
       line_y_start = 0,
@@ -1726,6 +1971,15 @@ plot_main_result_panel <- function(main_plot_data) {
       data = dplyr::filter(main_plot_data, metric == "Spearman\u2019s \u03c1"),
       binwidth = 0.2,
       boundary = -1.1,
+      ggplot2::aes(y = ggplot2::after_stat(count / sum(count)), fill = method),
+      color = "white",
+      linewidth = 0.45,
+      alpha = 0.95
+    ) +
+    ggplot2::geom_histogram(
+      data = dplyr::filter(main_plot_data, metric == winrate_metric_label),
+      binwidth = 0.05,
+      boundary = 0,
       ggplot2::aes(y = ggplot2::after_stat(count / sum(count)), fill = method),
       color = "white",
       linewidth = 0.45,
@@ -1856,6 +2110,48 @@ compute_one_block_rho <- function(block_dat, truth_order) {
   NA_real_
 }
 
+# Per-block win-rate companion to compute_one_block_rho. For a rubric block,
+# this is the mean correctness of the three within-block cross-rung pairs
+# (tie = 0.5). For a preference block, this is the mean correctness of the
+# three individual pairwise judgments (correct = preferred is higher-rung).
+compute_one_block_winrate <- function(block_dat, truth_order) {
+  block_method <- block_dat$method[[1]]
+  rung_rank_lookup <- stats::setNames(seq_along(truth_order), truth_order)
+
+  if (block_method == "rubric") {
+    rubric_rows <- block_dat %>%
+      dplyr::filter(rung_label %in% truth_order, !is.na(rubric_total_points)) %>%
+      dplyr::group_by(rung_label) %>%
+      dplyr::summarise(score = mean(rubric_total_points, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::mutate(rung_rank = unname(rung_rank_lookup[rung_label]))
+
+    if (nrow(rubric_rows) < 2) return(NA_real_)
+
+    pairs <- dplyr::cross_join(rubric_rows, rubric_rows, suffix = c("_a", "_b")) %>%
+      dplyr::filter(rung_rank_a < rung_rank_b)
+
+    if (nrow(pairs) == 0) return(NA_real_)
+
+    correct <- dplyr::case_when(
+      pairs$score_b > pairs$score_a ~ 1.0,
+      pairs$score_b < pairs$score_a ~ 0.0,
+      TRUE ~ 0.5
+    )
+    return(mean(correct))
+  }
+
+  if (block_method == "preference") {
+    comps <- build_preference_comparisons(block_dat, truth_order)
+    if (nrow(comps) == 0) return(NA_real_)
+    winner_rank <- unname(rung_rank_lookup[comps$winner])
+    loser_rank <- unname(rung_rank_lookup[comps$loser])
+    correct <- as.integer(winner_rank > loser_rank)
+    return(mean(correct))
+  }
+
+  NA_real_
+}
+
 build_block_rho_summary <- function(dat_complete, truth_order) {
   block_list <- dat_complete %>%
     dplyr::group_by(block_key) %>%
@@ -1875,26 +2171,46 @@ build_block_rho_summary <- function(dat_complete, truth_order) {
       task_category = meta$task_category,
       method = meta$method,
       block_rho = compute_one_block_rho(block_dat, truth_order),
+      block_winrate = compute_one_block_winrate(block_dat, truth_order),
       block_time_seconds = sum(block_dat$time_spent_seconds, na.rm = TRUE)
     )
   })
 }
 
 build_lawyer_dt_data <- function(block_rho_summary) {
-  block_rho_summary %>%
-    dplyr::filter(is.finite(block_rho), !is.na(years_experience_bin)) %>%
+  has_winrate <- "block_winrate" %in% names(block_rho_summary)
+
+  base <- block_rho_summary %>%
+    dplyr::filter(!is.na(years_experience_bin)) %>%
     dplyr::group_by(cluster_id, pipeline_instance_id, user_email) %>%
     dplyr::summarise(
       years_experience_bin = dplyr::first(years_experience_bin[!is.na(years_experience_bin)]),
-      rubric_rho = if (any(method == "rubric")) mean(block_rho[method == "rubric"], na.rm = TRUE) else NA_real_,
-      cj_rho = if (any(method == "preference")) mean(block_rho[method == "preference"], na.rm = TRUE) else NA_real_,
+      # rho path
+      rubric_rho = if (any(method == "rubric" & is.finite(block_rho))) {
+        mean(block_rho[method == "rubric"], na.rm = TRUE)
+      } else NA_real_,
+      cj_rho = if (any(method == "preference" & is.finite(block_rho))) {
+        mean(block_rho[method == "preference"], na.rm = TRUE)
+      } else NA_real_,
+      # winrate path
+      rubric_winrate = if (has_winrate && any(method == "rubric" & is.finite(block_winrate))) {
+        mean(block_winrate[method == "rubric"], na.rm = TRUE)
+      } else NA_real_,
+      cj_winrate = if (has_winrate && any(method == "preference" & is.finite(block_winrate))) {
+        mean(block_winrate[method == "preference"], na.rm = TRUE)
+      } else NA_real_,
       n_rubric_blocks = sum(method == "rubric"),
       n_cj_blocks = sum(method == "preference"),
       .groups = "drop"
     ) %>%
     # D_T is lawyer-level CJs minus Rubrics; positive values favor CJs.
-    dplyr::mutate(D_T = cj_rho - rubric_rho) %>%
-    dplyr::filter(is.finite(D_T), !is.na(years_experience_bin)) %>%
+    dplyr::mutate(
+      D_T = cj_rho - rubric_rho,
+      D_T_winrate = cj_winrate - rubric_winrate
+    )
+
+  base %>%
+    dplyr::filter(is.finite(D_T) | is.finite(D_T_winrate), !is.na(years_experience_bin)) %>%
     dplyr::mutate(
       years_experience_bin = factor(years_experience_bin, levels = experience_bin_levels)
     ) %>%
@@ -1903,16 +2219,46 @@ build_lawyer_dt_data <- function(block_rho_summary) {
 
 # Figure 4 (experience diagnostic). One jittered point per annotator/pipeline
 # instance with estimable D_t (CJ recovery minus rubric recovery); blue
-# diamonds mark the per-bin means of D_t. No fitted line or confidence band
+# diamonds mark the per-bin means of D_t. Two side-by-side panels: rank
+# correlation (left) and win rate (right). No fitted line or confidence band
 # is drawn -- the figure is a scatter, not a regression visualization.
 plot_experience_dt <- function(lawyer_dt_data) {
-  mean_data <- lawyer_dt_data %>%
-    dplyr::group_by(years_experience_bin) %>%
-    dplyr::summarise(mean_D_T = mean(D_T, na.rm = TRUE), .groups = "drop")
+  has_winrate <- "D_T_winrate" %in% names(lawyer_dt_data)
+
+  metric_levels_local <- if (has_winrate) {
+    c("Rank Correlation", "Win Rate")
+  } else {
+    c("Rank Correlation")
+  }
+
+  # Pivot to long format so we can facet by metric.
+  long_pieces <- list(
+    lawyer_dt_data %>%
+      dplyr::transmute(
+        years_experience_bin,
+        metric = "Rank Correlation",
+        D_T_value = D_T
+      )
+  )
+  if (has_winrate) {
+    long_pieces[[2]] <- lawyer_dt_data %>%
+      dplyr::transmute(
+        years_experience_bin,
+        metric = "Win Rate",
+        D_T_value = D_T_winrate
+      )
+  }
+  long_df <- dplyr::bind_rows(long_pieces) %>%
+    dplyr::filter(is.finite(D_T_value)) %>%
+    dplyr::mutate(metric = factor(metric, levels = metric_levels_local))
+
+  mean_data <- long_df %>%
+    dplyr::group_by(metric, years_experience_bin) %>%
+    dplyr::summarise(mean_D_T = mean(D_T_value, na.rm = TRUE), .groups = "drop")
 
   base_plot <- ggplot2::ggplot(
-    lawyer_dt_data,
-    ggplot2::aes(x = years_experience_bin, y = D_T)
+    long_df,
+    ggplot2::aes(x = years_experience_bin, y = D_T_value)
   ) +
     ggplot2::geom_hline(yintercept = 0, color = "grey88", linewidth = 0.35) +
     ggplot2::geom_jitter(
@@ -1934,7 +2280,8 @@ plot_experience_dt <- function(lawyer_dt_data) {
       stroke = 0.8,
       color = "#0D47A1",
       fill = "#FFFFFF"
-    )
+    ) +
+    ggplot2::facet_wrap(~ metric, nrow = 1, scales = "free_y")
 
   base_plot +
     ggplot2::labs(
@@ -1952,6 +2299,9 @@ plot_experience_dt <- function(lawyer_dt_data) {
         margin = ggplot2::margin(b = 12)
       ),
       plot.subtitle = ggplot2::element_blank(),
+      strip.background = ggplot2::element_rect(fill = "grey94", color = "grey70", linewidth = 0.35),
+      strip.text = ggplot2::element_text(face = "bold", size = 14),
+      panel.spacing = ggplot2::unit(1.2, "lines"),
       plot.margin = ggplot2::margin(t = 18, r = 18, b = 14, l = 18)
     )
 }
@@ -1986,6 +2336,12 @@ summarise_subset_estimate <- function(
   rubric_summary <- summarise_rubric_tasks(dat_subset, truth_order)
   estimate <- compute_study_estimate(pref_summary, rubric_summary)
 
+  # Win-rate companion (vSubmit_Expanded addition). Same per-subset aggregation
+  # using the per-task win-rate helpers.
+  pref_winrate_summary <- summarise_preference_winrate_tasks(dat_subset, truth_order)
+  rubric_winrate_summary <- summarise_rubric_winrate_tasks(dat_subset, truth_order)
+  winrate_estimate <- compute_study_winrate_estimate(pref_winrate_summary, rubric_winrate_summary)
+
   tibble::tibble(
     subset_type = subset_type,
     subset_order = subset_order,
@@ -1995,7 +2351,10 @@ summarise_subset_estimate <- function(
     count = dplyr::n_distinct(dat_subset$block_key),
     rubric_rho = estimate$mean_rho_rubric[[1]],
     cj_rho = estimate$mean_rho_preference[[1]],
-    D_hat = estimate$D_hat[[1]]
+    D_hat = estimate$D_hat[[1]],
+    rubric_winrate = winrate_estimate$mean_winrate_rubric[[1]],
+    cj_winrate = winrate_estimate$mean_winrate_preference[[1]],
+    D_hat_winrate = winrate_estimate$D_hat_winrate[[1]]
   )
 }
 
@@ -2072,7 +2431,10 @@ empty_autograder_subset_results <- function() {
     auto_count = integer(),
     auto_rubric_rho = numeric(),
     auto_cj_rho = numeric(),
-    auto_D_hat = numeric()
+    auto_D_hat = numeric(),
+    auto_rubric_winrate = numeric(),
+    auto_cj_winrate = numeric(),
+    auto_D_hat_winrate = numeric()
   )
 }
 
@@ -2115,7 +2477,10 @@ build_autograder_subset_results <- function(autograder_dat_complete, truth_order
       auto_count = count,
       auto_rubric_rho = rubric_rho,
       auto_cj_rho = cj_rho,
-      auto_D_hat = D_hat
+      auto_D_hat = D_hat,
+      auto_rubric_winrate = rubric_winrate,
+      auto_cj_winrate = cj_winrate,
+      auto_D_hat_winrate = D_hat_winrate
     )
 }
 
@@ -2167,7 +2532,8 @@ build_subgroup_results_table <- function(
       subset_type,
       subgroup_variable,
       subgroup_level,
-      auto_mini_D_hat = auto_D_hat
+      auto_mini_D_hat = auto_D_hat,
+      auto_mini_D_hat_winrate = auto_D_hat_winrate
     )
 
   human_results %>%
@@ -2223,16 +2589,112 @@ latex_subgroup_results_table <- function(display_table) {
   )
   header <- c(
     "Subset", "Variable", "Level", "$n$", "\\mbox{$\\bar{R}^{\\mathrm{CJ}}$}", "\\mbox{$\\bar{R}^{\\mathrm{rub}}$}",
-    "$\\widehat{D}$", "\\shortstack{GPT-5.4\\\\$n$}", "\\shortstack{GPT-5.4\\\\$\\bar{R}^{\\mathrm{CJ}}$}", "\\shortstack{GPT-5.4\\\\$\\bar{R}^{\\mathrm{rub}}$}",
-    "\\shortstack{GPT-5.4\\\\$\\widehat{D}$}", "\\shortstack{GPT-5.4-mini\\\\$\\widehat{D}$}"
+    "$\\widehat{D}_{\\rho}$", "\\shortstack{GPT-5.4\\\\$n$}", "\\shortstack{GPT-5.4\\\\$\\bar{R}^{\\mathrm{CJ}}$}", "\\shortstack{GPT-5.4\\\\$\\bar{R}^{\\mathrm{rub}}$}",
+    "\\shortstack{GPT-5.4\\\\$\\widehat{D}_{\\rho}$}", "\\shortstack{GPT-5.4-mini\\\\$\\widehat{D}_{\\rho}$}"
   )
 
   lines <- c(
     "% Requires \\usepackage{booktabs}",
     "% Requires \\usepackage{array}",
     "\\begin{table}[!t]",
-    "  \\caption{Subgroup recovery summary. For each subgroup, $\\bar{R}^{\\mathrm{CJ}}$ and $\\bar{R}^{\\mathrm{rub}}$ report the mean task-level recovery statistic under comparative judgment and rubric scoring, respectively, where task-level recovery is Spearman's rank correlation between the constructed quality ordering and the method-implied ordering. $\\widehat{D}=\\bar{R}^{\\mathrm{CJ}}-\\bar{R}^{\\mathrm{rub}}$, so positive values favor comparative judgments. The $n$ columns report complete task-method blocks contributing to the subgroup before task-level aggregation. GPT-5.4 columns report the corresponding LLM autograder evaluations; the GPT-5.4-mini column reports the method difference for the same full/task subsets. Autograder columns are blank for annotator-defined subgroups.}",
+    "  \\caption{Subgroup recovery summary. For each subgroup, $\\bar{R}^{\\mathrm{CJ}}$ and $\\bar{R}^{\\mathrm{rub}}$ report the mean task-level recovery statistic under comparative judgment and rubric scoring, respectively, where task-level recovery is Spearman's rank correlation between the constructed quality ordering and the method-implied ordering. $\\widehat{D}_{\\rho}=\\bar{R}^{\\mathrm{CJ}}-\\bar{R}^{\\mathrm{rub}}$, so positive values favor comparative judgments. The $n$ columns report complete task-method evaluations contributing to the subgroup before task-level aggregation. GPT-5.4 columns report the corresponding LLM autograder evaluations; the GPT-5.4-mini column reports the method difference for the same full/task subsets. Autograder columns are blank for annotator-defined subgroups.}",
     "  \\label{tab:subgroup-recovery-summary}",
+    "  \\centering",
+    "  \\scriptsize",
+    "  \\setlength{\\tabcolsep}{1pt}",
+    "  \\renewcommand{\\arraystretch}{1.12}",
+    "  \\begin{tabular}{@{}",
+    "    >{\\raggedright\\arraybackslash}p{0.101\\textwidth}",
+    "    >{\\raggedright\\arraybackslash}p{0.156\\textwidth}",
+    "    >{\\raggedright\\arraybackslash}p{0.084\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.037\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.057\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.057\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.057\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.057\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.086\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.086\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.070\\textwidth}",
+    "    >{\\centering\\arraybackslash}p{0.105\\textwidth}",
+    "  @{}}",
+    "    \\toprule",
+    paste0("    ", paste(header, collapse = " & "), " \\\\"),
+    "    \\midrule"
+  )
+
+  for (i in seq_len(nrow(display_table))) {
+    if (i > 1 && display_table$`Subset Type`[[i]] != display_table$`Subset Type`[[i - 1]]) {
+      lines <- c(lines, "    \\addlinespace[0.35em]")
+    } else if (i > 1 && display_table$Variable[[i]] != display_table$Variable[[i - 1]]) {
+      lines <- c(lines, "    \\addlinespace[0.18em]")
+    }
+
+    values <- as.character(unlist(display_table[i, columns], use.names = FALSE))
+    values[is.na(values)] <- ""
+    lines <- c(lines, paste0("    ", paste(latex_table_cell(values), collapse = " & "), " \\\\"))
+  }
+
+  c(
+    lines,
+    "    \\bottomrule",
+    "  \\end{tabular}",
+    "\\end{table}"
+  )
+}
+
+# ============================================================
+# Win-rate companion: Table 4b (subgroup recovery summary, win rate)
+# ============================================================
+# Parallel of format_subgroup_results_table / latex_subgroup_results_table for
+# the per-judgment pairwise win-rate metric. Same row layout as Table 4a, same
+# subgroups, same evaluator types; columns swap rho symbols for win-rate symbols
+# ($\bar{W}^{\mathrm{CJ}}$, $\bar{W}^{\mathrm{rub}}$, $\widehat{D}_{W}$).
+
+auto_mini_winrate_display_column <- "Auto \\widehat{D}_{W,5.4-mini}"
+
+format_subgroup_results_table_winrate <- function(subgroup_results) {
+  display_table <- subgroup_results %>%
+    dplyr::transmute(
+      `Subset Type` = as.character(subset_type),
+      Variable = as.character(subgroup_variable),
+      Level = subgroup_level,
+      Count = count,
+      `CJ W` = fmt_num(cj_winrate, 3),
+      `Rubrics W` = fmt_num(rubric_winrate, 3),
+      D_hat_W = fmt_num(D_hat_winrate, 3),
+      `Auto Count` = ifelse(is.na(auto_count), "", as.character(auto_count)),
+      `Auto CJ W` = ifelse(is.na(auto_cj_winrate), "", fmt_num(auto_cj_winrate, 3)),
+      `Auto Rubrics W` = ifelse(is.na(auto_rubric_winrate), "", fmt_num(auto_rubric_winrate, 3)),
+      Auto_D_hat_W = ifelse(is.na(auto_D_hat_winrate), "", fmt_num(auto_D_hat_winrate, 3)),
+      Auto_D_hat_W_5_4_mini = ifelse(is.na(auto_mini_D_hat_winrate), "", fmt_num(auto_mini_D_hat_winrate, 3))
+    )
+
+  names(display_table)[names(display_table) == "Auto_D_hat_W_5_4_mini"] <- auto_mini_winrate_display_column
+  display_table
+}
+
+latex_subgroup_results_table_winrate <- function(display_table) {
+  columns <- c(
+    "Subset Type", "Variable", "Level", "Count", "CJ W", "Rubrics W", "D_hat_W",
+    "Auto Count", "Auto CJ W", "Auto Rubrics W", "Auto_D_hat_W", auto_mini_winrate_display_column
+  )
+  header <- c(
+    "Subset", "Variable", "Level", "$n$",
+    "\\mbox{$\\bar{W}^{\\mathrm{CJ}}$}", "\\mbox{$\\bar{W}^{\\mathrm{rub}}$}",
+    "$\\widehat{D}_{W}$",
+    "\\shortstack{GPT-5.4\\\\$n$}",
+    "\\shortstack{GPT-5.4\\\\$\\bar{W}^{\\mathrm{CJ}}$}",
+    "\\shortstack{GPT-5.4\\\\$\\bar{W}^{\\mathrm{rub}}$}",
+    "\\shortstack{GPT-5.4\\\\$\\widehat{D}_{W}$}",
+    "\\shortstack{GPT-5.4-mini\\\\$\\widehat{D}_{W}$}"
+  )
+
+  lines <- c(
+    "% Requires \\usepackage{booktabs}",
+    "% Requires \\usepackage{array}",
+    "\\begin{table}[!t]",
+    "  \\caption{Subgroup recovery summary (pairwise win-rate metric). For each subgroup, $\\bar{W}^{\\mathrm{CJ}}$ and $\\bar{W}^{\\mathrm{rub}}$ report the mean task-level pairwise win rate under comparative judgment and rubric scoring, respectively, where the per-task win rate is the share of pairwise comparisons across quality levels whose preferred or higher-scored output is the one at the higher quality level (ties, only possible in the rubric protocol, count as 0.5). $\\widehat{D}_{W}=\\bar{W}^{\\mathrm{CJ}}-\\bar{W}^{\\mathrm{rub}}$, so positive values favor comparative judgments. The $n$ columns report complete task-method evaluations contributing to the subgroup before task-level aggregation. GPT-5.4 columns report the corresponding LLM autograder evaluations; the GPT-5.4-mini column reports the method difference for the same full/task subsets. Autograder columns are blank for annotator-defined subgroups.}",
+    "  \\label{tab:subgroup-recovery-summary-winrate}",
     "  \\centering",
     "  \\scriptsize",
     "  \\setlength{\\tabcolsep}{1pt}",
@@ -3065,23 +3527,43 @@ plot_rubric_scores_by_quality_level <- function(
     )
 }
 
-plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL) {
+plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL,
+                                        observed_D_hat_winrate = NULL) {
   if (!("evaluator_type" %in% names(boot_tbl))) {
     boot_tbl$evaluator_type <- "Human"
   }
 
-  plot_df <- boot_tbl %>%
-    dplyr::transmute(
-      evaluator_type = .data$evaluator_type,
-      bootstrap_D_hat = .data$D_hat
-    ) %>%
+  # Pivot boot_tbl to long format (one row per replicate × evaluator × metric).
+  # The bootstrap output already carries both D_hat and D_hat_winrate columns.
+  has_winrate <- "D_hat_winrate" %in% names(boot_tbl)
+
+  metric_levels_local <- if (has_winrate) {
+    c("Rank Correlation", "Win Rate")
+  } else {
+    c("Rank Correlation")
+  }
+
+  long_cols <- c(`Rank Correlation` = "D_hat")
+  if (has_winrate) long_cols <- c(long_cols, `Win Rate` = "D_hat_winrate")
+
+  long_pieces <- lapply(names(long_cols), function(metric_label) {
+    col_name <- long_cols[[metric_label]]
+    tibble::tibble(
+      evaluator_type = boot_tbl$evaluator_type,
+      metric = metric_label,
+      bootstrap_D_hat = boot_tbl[[col_name]]
+    )
+  })
+  plot_df <- dplyr::bind_rows(long_pieces) %>%
     dplyr::filter(is.finite(.data$bootstrap_D_hat)) %>%
     dplyr::mutate(
       evaluator_type = factor(
         .data$evaluator_type,
         levels = c("Human", "LLM-as-a-Judge")
-      )
+      ),
+      metric = factor(.data$metric, levels = metric_levels_local)
     )
+
   line_color <- "#1565C0"
   estimate_color <- "#B45309"
 
@@ -3098,25 +3580,34 @@ plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL) {
     )
   }
 
-  observed_df <- tibble::tibble(
-    evaluator_type = character(),
-    observed_D_hat = numeric()
-  )
-
-  if (!is.null(observed_D_hat)) {
-    if (is.null(names(observed_D_hat))) {
-      names(observed_D_hat) <- levels(plot_df$evaluator_type)[seq_along(observed_D_hat)]
+  # Build a long observed-value tibble keyed by (evaluator_type, metric).
+  build_observed_long <- function(observed_vec, metric_label) {
+    if (is.null(observed_vec)) return(NULL)
+    if (is.null(names(observed_vec))) {
+      names(observed_vec) <- levels(plot_df$evaluator_type)[seq_along(observed_vec)]
     }
-    observed_df <- tibble::tibble(
-      evaluator_type = factor(names(observed_D_hat), levels = levels(plot_df$evaluator_type)),
-      observed_D_hat = as.numeric(observed_D_hat)
+    tibble::tibble(
+      evaluator_type = factor(names(observed_vec), levels = levels(plot_df$evaluator_type)),
+      metric = factor(metric_label, levels = metric_levels_local),
+      observed_D_hat = as.numeric(observed_vec)
     ) %>%
       dplyr::filter(!is.na(.data$evaluator_type), is.finite(.data$observed_D_hat))
   }
+  observed_df <- dplyr::bind_rows(
+    build_observed_long(observed_D_hat, "Rank Correlation"),
+    if (has_winrate) build_observed_long(observed_D_hat_winrate, "Win Rate") else NULL
+  )
+  if (is.null(observed_df)) {
+    observed_df <- tibble::tibble(
+      evaluator_type = factor(character(), levels = levels(plot_df$evaluator_type)),
+      metric = factor(character(), levels = metric_levels_local),
+      observed_D_hat = numeric()
+    )
+  }
 
   plot_df <- plot_df %>%
-    dplyr::left_join(observed_df, by = "evaluator_type") %>%
-    dplyr::group_by(.data$evaluator_type) %>%
+    dplyr::left_join(observed_df, by = c("evaluator_type", "metric")) %>%
+    dplyr::group_by(.data$evaluator_type, .data$metric) %>%
     dplyr::mutate(
       bootstrap_center = mean(.data$bootstrap_D_hat, na.rm = TRUE),
       plot_center = dplyr::if_else(
@@ -3130,10 +3621,10 @@ plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL) {
     dplyr::filter(is.finite(.data$plotted_D_hat))
 
   observed_line_df <- plot_df %>%
-    dplyr::distinct(.data$evaluator_type, .data$plot_center)
+    dplyr::distinct(.data$evaluator_type, .data$metric, .data$plot_center)
 
   ci_df <- plot_df %>%
-    dplyr::group_by(.data$evaluator_type) %>%
+    dplyr::group_by(.data$evaluator_type, .data$metric) %>%
     dplyr::summarise(
       plot_center = dplyr::first(.data$plot_center),
       bootstrap_se_D_hat = stats::sd(.data$bootstrap_D_hat),
@@ -3153,20 +3644,19 @@ plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL) {
       values_to = "xintercept"
     )
 
-  # Keep only a small amount of x-axis padding while preserving all interval lines.
-  x_range <- range(c(plot_df$plotted_D_hat, observed_line_df$plot_center, ci_df$xintercept, 0), na.rm = TRUE)
-  x_span <- diff(x_range)
-
-  if (!is.finite(x_span) || x_span <= 0) {
-    x_span <- 1
-  }
-
-  x_left <- x_range[[1]] - 0.035 * x_span
-  x_right <- x_range[[2]] + 0.035 * x_span
-
   ggplot2::ggplot(plot_df, ggplot2::aes(x = .data$plotted_D_hat)) +
+    # Split histogram by metric so the win-rate panels get finer bins
+    # (their data range is narrower than the rank-correlation panels).
     ggplot2::geom_histogram(
+      data = dplyr::filter(plot_df, .data$metric == "Rank Correlation"),
       bins = 30,
+      fill = "grey75",
+      color = "black",
+      linewidth = 0.35
+    ) +
+    ggplot2::geom_histogram(
+      data = dplyr::filter(plot_df, .data$metric == "Win Rate"),
+      bins = 60,
       fill = "grey75",
       color = "black",
       linewidth = 0.35
@@ -3191,16 +3681,13 @@ plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL) {
       linetype = "solid",
       linewidth = 1.05
     ) +
-    ggplot2::facet_wrap(
-      ~ evaluator_type,
-      nrow = 1
-    ) +
-    ggplot2::coord_cartesian(
-      xlim = c(x_left, x_right),
-      clip = "on"
+    ggplot2::facet_grid(
+      metric ~ evaluator_type,
+      scales = "free_x",
+      switch = "y"
     ) +
     ggplot2::scale_x_continuous(
-      expand = ggplot2::expansion(mult = c(0, 0))
+      expand = ggplot2::expansion(mult = c(0.04, 0.04))
     ) +
     ggplot2::scale_y_continuous(
       expand = ggplot2::expansion(mult = c(0, 0.08))
@@ -3225,6 +3712,7 @@ plot_bootstrap_distribution <- function(boot_tbl, observed_D_hat = NULL) {
       panel.grid.minor = ggplot2::element_line(linewidth = 0.25),
       strip.background = ggplot2::element_rect(fill = "grey94", color = "grey70", linewidth = 0.35),
       strip.text = ggplot2::element_text(face = "bold", size = 14),
+      strip.placement = "outside",
       panel.spacing = ggplot2::unit(1.0, "lines"),
       plot.margin = ggplot2::margin(t = 28, r = 28, b = 12, l = 12)
     )
@@ -3403,7 +3891,8 @@ print_tie_summary_table <- function(
   }
 }
 
-print_main_result <- function(study_estimate, boot_summary, analysis_mode) {
+print_main_result <- function(study_estimate, boot_summary, analysis_mode,
+                              study_winrate_estimate = NULL) {
   sub_header("Primary comparison")
   cat("Study-level estimand: D̂ = average Comparative Judgment rho - average Rubric rho\n")
   cat("Inference: ", mode_bootstrap_label(analysis_mode), "\n\n", sep = "")
@@ -3434,6 +3923,46 @@ print_main_result <- function(study_estimate, boot_summary, analysis_mode) {
       "This usually means the current completed sample is too sparse for one of the methods after resampling.\n",
       sep = ""
     )
+  }
+
+  # -------------------------------------------------------------
+  # Win-rate companion block (vSubmit_Expanded addition)
+  # -------------------------------------------------------------
+  if (!is.null(study_winrate_estimate) &&
+      !is.null(boot_summary$observed_D_hat_winrate)) {
+    cat("\n--- Win-rate companion (individual-judgment pairwise) ---\n")
+    cat("Study-level estimand: D̂_winrate = average CJ win rate - average Rubric win rate\n")
+    cat("  (CJ correct = picked higher-rank rung; Rubric pair tie = 0.5)\n\n")
+    cat(sprintf("Rubric tasks averaged (winrate):       %s\n",
+                study_winrate_estimate$n_tasks_winrate_rubric[[1]]))
+    cat(sprintf("CJ tasks averaged (winrate):           %s\n",
+                study_winrate_estimate$n_tasks_winrate_preference[[1]]))
+    cat(sprintf("Observed mean Rubric win rate:         %s\n",
+                fmt_num(study_winrate_estimate$mean_winrate_rubric[[1]], 3)))
+    cat(sprintf("Observed mean CJ win rate:             %s\n",
+                fmt_num(study_winrate_estimate$mean_winrate_preference[[1]], 3)))
+    cat(sprintf("Observed D̂_winrate:                   %s\n",
+                fmt_num(study_winrate_estimate$D_hat_winrate[[1]], 3)))
+    cat(sprintf("Finite bootstrap draws (winrate):      %s of %s\n",
+                boot_summary$n_finite_boot_winrate[[1]], boot_summary$n_boot[[1]]))
+    cat(sprintf("Bootstrap SE for observed D̂_winrate:  %s\n",
+                fmt_num(boot_summary$bootstrap_se_D_hat_winrate[[1]], 3)))
+    cat(sprintf(
+      "95%% centered bootstrap-SE CI for D̂_winrate: [%s, %s]\n",
+      fmt_num(boot_summary$centered_ci_lower_winrate[[1]], 3),
+      fmt_num(boot_summary$centered_ci_upper_winrate[[1]], 3)
+    ))
+    cat(sprintf("Bootstrap mean D̂_winrate (diagnostic): %s\n",
+                fmt_num(boot_summary$bootstrap_mean_D_hat_winrate[[1]], 3)))
+    cat(sprintf(
+      "Raw percentile bootstrap CI (diagnostic):  [%s, %s]\n",
+      fmt_num(boot_summary$ci_lower_winrate[[1]], 3),
+      fmt_num(boot_summary$ci_upper_winrate[[1]], 3)
+    ))
+    cat(sprintf("Pr(D_boot_winrate > 0; diagnostic):    %s\n",
+                fmt_pct(boot_summary$prop_D_hat_winrate_gt_0[[1]], 1)))
+    cat(sprintf("Pr(D_boot_winrate < 0; diagnostic):    %s\n",
+                fmt_pct(boot_summary$prop_D_hat_winrate_lt_0[[1]], 1)))
   }
 }
 
@@ -3548,6 +4077,13 @@ mini_autograder_complete_dat <- mini_autograder_validation$analysis_dat
 pref_task_summary <- summarise_preference_tasks(complete_dat, truth_order)
 rubric_task_summary <- summarise_rubric_tasks(complete_dat, truth_order)
 study_estimate <- compute_study_estimate(pref_task_summary, rubric_task_summary)
+# Win-rate companion (vSubmit_Expanded addition)
+pref_winrate_task_summary <- summarise_preference_winrate_tasks(complete_dat, truth_order)
+rubric_winrate_task_summary <- summarise_rubric_winrate_tasks(complete_dat, truth_order)
+study_winrate_estimate <- compute_study_winrate_estimate(
+  pref_winrate_task_summary,
+  rubric_winrate_task_summary
+)
 method_summary <- build_method_summary(pref_task_summary, rubric_task_summary)
 method_agreement <- summarise_method_agreement(
   rubric_task_summary,
@@ -3559,6 +4095,13 @@ autograder_rubric_task_summary <- summarise_rubric_tasks(autograder_complete_dat
 autograder_study_estimate <- compute_study_estimate(
   autograder_pref_task_summary,
   autograder_rubric_task_summary
+)
+# Win-rate companion for LLM-as-a-Judge
+autograder_pref_winrate_task_summary <- summarise_preference_winrate_tasks(autograder_complete_dat, truth_order)
+autograder_rubric_winrate_task_summary <- summarise_rubric_winrate_tasks(autograder_complete_dat, truth_order)
+autograder_study_winrate_estimate <- compute_study_winrate_estimate(
+  autograder_pref_winrate_task_summary,
+  autograder_rubric_winrate_task_summary
 )
 autograder_method_summary <- build_method_summary(
   autograder_pref_task_summary,
@@ -3574,7 +4117,9 @@ mini_autograder_rubric_task_summary <- summarise_rubric_tasks(mini_autograder_co
 main_plot_data <- build_main_plot_data(
   pref_task_summary = pref_task_summary,
   rubric_task_summary = rubric_task_summary,
-  dat_complete = complete_dat
+  dat_complete = complete_dat,
+  pref_winrate_task_summary = pref_winrate_task_summary,
+  rubric_winrate_task_summary = rubric_winrate_task_summary
 )
 main_plot <- plot_main_result_panel(main_plot_data)
 block_rho_summary <- build_block_rho_summary(complete_dat, truth_order)
@@ -3587,6 +4132,7 @@ subgroup_results <- build_subgroup_results_table(
   autograder_mini_dat_complete = mini_autograder_complete_dat
 )
 subgroup_display_table <- format_subgroup_results_table(subgroup_results)
+subgroup_display_table_winrate <- format_subgroup_results_table_winrate(subgroup_results)
 rubric_score_data <- build_positive_rubric_score_data(
   human_dat_complete = complete_dat,
   autograder_dat_complete = autograder_complete_dat
@@ -3632,7 +4178,8 @@ boot_out <- bootstrap_cluster_hierarchical(
   truth_order = truth_order,
   n_boot = n_boot,
   seed = seed,
-  observed_D_hat = study_estimate$D_hat[[1]]
+  observed_D_hat = study_estimate$D_hat[[1]],
+  observed_D_hat_winrate = study_winrate_estimate$D_hat_winrate[[1]]
 )
 
 cat("\nRunning LLM-as-a-Judge ", mode_bootstrap_label("llm_both"), "...\n", sep = "")
@@ -3641,7 +4188,8 @@ autograder_boot_out <- bootstrap_cluster_hierarchical(
   truth_order = truth_order,
   n_boot = n_boot,
   seed = seed + 1L,
-  observed_D_hat = autograder_study_estimate$D_hat[[1]]
+  observed_D_hat = autograder_study_estimate$D_hat[[1]],
+  observed_D_hat_winrate = autograder_study_winrate_estimate$D_hat_winrate[[1]]
 )
 
 boot_tbl <- dplyr::bind_rows(
@@ -3658,13 +4206,18 @@ bootstrap_plot <- plot_bootstrap_distribution(
   observed_D_hat = c(
     "Human" = study_estimate$D_hat[[1]],
     "LLM-as-a-Judge" = autograder_study_estimate$D_hat[[1]]
+  ),
+  observed_D_hat_winrate = c(
+    "Human" = study_winrate_estimate$D_hat_winrate[[1]],
+    "LLM-as-a-Judge" = autograder_study_winrate_estimate$D_hat_winrate[[1]]
   )
 )
 
 sub_header("Human annotators")
 print_validation_summary(validation, study_estimate)
 print_method_summary(method_summary)
-print_main_result(study_estimate, boot_summary, analysis_mode = analysis_mode)
+print_main_result(study_estimate, boot_summary, analysis_mode = analysis_mode,
+                  study_winrate_estimate = study_winrate_estimate)
 print_method_agreement(method_agreement)
 print_publication_timing_diagnostic(complete_dat)
 sub_header("LLM-as-a-Judge")
@@ -3673,7 +4226,8 @@ print_method_summary(autograder_method_summary)
 print_main_result(
   autograder_study_estimate,
   autograder_boot_summary,
-  analysis_mode = "llm_both"
+  analysis_mode = "llm_both",
+  study_winrate_estimate = autograder_study_winrate_estimate
 )
 print_method_agreement(autograder_method_agreement)
 print_tie_summary_table(
@@ -3758,6 +4312,14 @@ if (isTRUE(save_plot)) {
     output_dir,
     "table4_subgroup_recovery.tex"
   )
+  table_winrate_tex_path <- file.path(
+    output_dir,
+    "table4b_subgroup_recovery_winrate.tex"
+  )
+  table_winrate_csv_path <- file.path(
+    output_dir,
+    "table4b_subgroup_recovery_winrate.csv"
+  )
   rubric_score_plot_path <- file.path(
     output_dir,
     "rubric_score_diagnostic.png"
@@ -3794,6 +4356,9 @@ if (isTRUE(save_plot)) {
   )
   readr::write_csv(subgroup_results, table_csv_path)
   write_lines(latex_subgroup_results_table(subgroup_display_table), table_tex_path)
+  write_lines(latex_subgroup_results_table_winrate(subgroup_display_table_winrate),
+              table_winrate_tex_path)
+  readr::write_csv(subgroup_display_table_winrate, table_winrate_csv_path)
   readr::write_csv(adjacency_data, adjacency_csv_path)
   write_lines(latex_adjacency_table(adjacency_data), adjacency_tex_path)
   ggplot2::ggsave(
@@ -3827,6 +4392,8 @@ if (isTRUE(save_plot)) {
   cat("Saved figure4_experience_diagnostic.png to:\n", experience_plot_path, "\n", sep = "")
   cat("Saved table4_subgroup_recovery.csv to:\n", table_csv_path, "\n", sep = "")
   cat("Saved table4_subgroup_recovery.tex to:\n", table_tex_path, "\n", sep = "")
+  cat("Saved table4b_subgroup_recovery_winrate.tex to:\n", table_winrate_tex_path, "\n", sep = "")
+  cat("Saved table4b_subgroup_recovery_winrate.csv to:\n", table_winrate_csv_path, "\n", sep = "")
   cat("Saved rubric_score_diagnostic.png to:\n", rubric_score_plot_path, "\n", sep = "")
   cat("Saved figure3_quality_level_score_distributions.png to:\n", quality_level_positive_score_plot_path, "\n", sep = "")
   cat("Saved table5_adjacent_pair_recovery.csv to:\n", adjacency_csv_path, "\n", sep = "")
