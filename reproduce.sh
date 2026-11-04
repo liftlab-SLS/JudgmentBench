@@ -29,5 +29,11 @@ Rscript "$ROOT_DIR/analysis/analysis_vSubmit.R"
 echo "Running descriptive tables..."
 Rscript "$ROOT_DIR/tables/tables_vSubmit.R"
 
+echo "Running supplemental analyses (no model API calls)..."
+Rscript "$ROOT_DIR/analysis/supplemental_analysis_vSubmit.R"
+
+echo "Checking released joins and reported numerical results..."
+Rscript "$ROOT_DIR/scripts/validate_supplemental.R"
+
 echo
 echo "Done. Outputs in: $OUT_DIR"
