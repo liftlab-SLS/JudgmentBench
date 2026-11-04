@@ -13,3 +13,5 @@ gtable
 jsonlite
 patchwork
 stringr
+pROC
+digest

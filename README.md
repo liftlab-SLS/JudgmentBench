@@ -1,8 +1,8 @@
 # JudgmentBench: Analysis and Tables Code
 
 Reproduction code for the paper *JudgmentBench: Comparing Rubric and Preference
-Evaluation for Quality Assessment*. Two R scripts regenerate every figure and
-table reported in the paper from the released benchmark dataset.
+Evaluation for Quality Assessment*. The R scripts reproduce the original study. Supplemental analyses are
+described below.
 
 The [JudgmentBench dataset](https://huggingface.co/datasets/judgmentbench/JudgmentBench)
 is available on Hugging Face.
@@ -16,9 +16,15 @@ is available on Hugging Face.
 ├── requirements.txt     # R packages used by the scripts
 ├── reproduce.sh         # one-shot reproduction wrapper
 ├── analysis/
-│   └── analysis_vSubmit.R
-└── tables/
-    └── tables_vSubmit.R
+│   ├── analysis_vSubmit.R
+│   ├── supplemental_analysis_vSubmit.R
+│   ├── generation_protocol.R
+│   └── bootstrap_weights.rds
+├── tables/
+│   └── tables_vSubmit.R
+└── scripts/
+    ├── build_supplemental_data.R
+    └── validate_supplemental.R
 ```
 
 ## Specification of dependencies
@@ -27,14 +33,15 @@ is available on Hugging Face.
 - The R packages listed in `requirements.txt`. Install them with:
 
   ```
-  Rscript -e 'install.packages(c("dplyr","tidyr","readr","tibble","ggplot2","purrr","ragg","gtable","jsonlite","patchwork","stringr"))'
+  Rscript -e 'install.packages(c("dplyr","tidyr","readr","tibble","ggplot2","purrr","ragg","gtable","jsonlite","patchwork","stringr","pROC","digest"))'
   ```
 
   `analysis_vSubmit.R` will install missing packages on the fly (controlled by
   the `install_missing_packages` flag near the top of the script);
   `tables_vSubmit.R` aborts with a clear message if any package is missing.
 
-No GPU, accelerator, proprietary library, or network access is required.
+No GPU or model API calls are required. After downloading data and dependencies,
+analysis runs locally. All analyses use R.
 
 ## Data
 
@@ -152,3 +159,38 @@ for `tables_vSubmit.R`. Peak memory under 1 GB.
 ## License
 
 MIT (see `LICENSE`).
+
+
+## Supplemental analyses
+
+`reproduce.sh` also runs the added R analyses and checks. To run them alone:
+
+```sh
+export EAH_JB_DIR=/path/to/dataset
+export EAH_ANALYSIS_OUTPUT_DIR=outputs
+Rscript analysis/supplemental_analysis_vSubmit.R
+Rscript scripts/validate_supplemental.R
+```
+
+Results go to `outputs/supplemental/`: length inversion/decomposition, length
+diagnostics, criterion ties/deductions, stability/alpha, eight-model win rates,
+mixed-quality comparisons, timing, valuation and surface-feature AUCs.
+The original R analysis is unchanged.
+
+Follow-up intervals use 200,000 paired annotator-cluster resamples (seed 20261014).
+Stability intervals use fixed leave-one-out consensus labels, excluding 52 ties
+(seed 20261030); this reconstructs the reported interval. `bootstrap_weights.rds`
+stores the original cluster multiplicities so the R code uses the same resamples.
+Interval alpha uses 0–2 win counts within task × quality units. Bonferroni uses
+the table's 12 distinct quality-pair tests; that family is reconstructed.
+
+The surface-feature section retains the recovered rebuttal analysis: five task-held-out
+folds, logistic regression on seven A−B surface features, and the original
+vowel-group approximation for syllables. AUCs are 0.670 / 0.566 / 0.746 for
+Human / GPT-5.4 / GPT-5.4-mini. Features, folds and predictions are saved.
+
+Generation ran in Python. `generation_protocol.R` implements the same word
+counter and retry rule for validation; it does not call a model or run RAG.
+`Rscript scripts/build_supplemental_data.R --help` describes building anonymized
+additions from frozen exports. Original length diagnostics use whitespace counts;
+generation uses the regex counter. Dataset folder READMEs define joins.
