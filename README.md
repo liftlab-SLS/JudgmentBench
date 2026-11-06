@@ -56,11 +56,11 @@ git clone https://huggingface.co/datasets/judgmentbench/JudgmentBench
 export EAH_JB_DIR=$(pwd)/JudgmentBench
 ```
 
-**Option B — `huggingface-cli download`:**
+**Option B — `hf download`:**
 
 ```
 pip install huggingface_hub
-huggingface-cli download judgmentbench/JudgmentBench \
+hf download judgmentbench/JudgmentBench \
     --repo-type dataset --local-dir ./result-dataset
 export EAH_JB_DIR=$(pwd)/result-dataset
 ```
@@ -123,15 +123,16 @@ Rscript tables/tables_vSubmit.R         # ~30 sec
 
 | Paper artifact                          | Output file                                       | Script                  |
 |-----------------------------------------|---------------------------------------------------|-------------------------|
-| Figure 1 (main results)                 | `figure1_main_results.png`                        | `analysis_vSubmit.R`    |
-| Figure 2 (bootstrap distribution)       | `figure2_bootstrap_distribution.png`              | `analysis_vSubmit.R`    |
-| Figure 3 (quality-level score dists.)   | `figure3_quality_level_score_distributions.png`   | `analysis_vSubmit.R`    |
+| Figure 2 (main results)                 | `figure1_main_results.png`                        | `analysis_vSubmit.R`    |
+| Figure 3 (bootstrap distribution)       | `figure2_bootstrap_distribution.png`              | `analysis_vSubmit.R`    |
+| Figure 5 (quality-level score dists.)   | `figure3_quality_level_score_distributions.png`   | `analysis_vSubmit.R`    |
 | Figure 4 (experience diagnostic)        | `figure4_experience_diagnostic.png`               | `analysis_vSubmit.R`    |
 | Table 1 (sampled tasks by type)         | `table1_sampled_tasks_by_type.tex`                | `tables_vSubmit.R`      |
-| Table 2 (benchmark tasks)               | `table2_benchmark_tasks.tex`                      | `tables_vSubmit.R`      |
-| Table 3 (annotator information)         | `table3_annotator_information.tex`                | `tables_vSubmit.R`      |
-| Table 4 (subgroup recovery)             | `table4_subgroup_recovery.tex`                    | `analysis_vSubmit.R`    |
-| Table 5 (adjacent-pair recovery)        | `table5_adjacent_pair_recovery.tex`               | `analysis_vSubmit.R`    |
+| Table 5 (benchmark tasks)               | `table2_benchmark_tasks.tex`                      | `tables_vSubmit.R`      |
+| Table 6 (annotator information)         | `table3_annotator_information.tex`                | `tables_vSubmit.R`      |
+| Table 7a (subgroup rank recovery)       | `table4_subgroup_recovery.tex`                    | `analysis_vSubmit.R`    |
+| Table 7b (subgroup win rates)           | `table4b_subgroup_recovery_winrate.tex`            | `analysis_vSubmit.R`    |
+| Table 8 (adjacent-pair recovery)        | `table5_adjacent_pair_recovery.tex`               | `analysis_vSubmit.R`    |
 
 CSV companions are written alongside each `.tex` file. Diagnostics for the
 descriptive tables go to `outputs/diagnostics/`.
